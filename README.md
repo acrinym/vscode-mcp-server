@@ -231,6 +231,20 @@ The extension creates an MCP server that:
 
 Currently, only one workspace is supported. The extension also only works locally, to avoid exposing your VS Code instance to any network you may be connected to.
 
+### Remote / non-loopback use
+
+The server has no authentication and exposes shell and file access. It therefore
+refuses to start when `vscode-mcp-server.host` is set to a non-loopback address;
+use the default `127.0.0.1` (or `localhost`). Cross-origin (CORS) requests are
+only allowed from loopback origins, so a web page served from the network cannot
+drive the server. Local command-line MCP clients (for example via `mcp-remote`)
+are unaffected because they do not send a browser `Origin` header.
+
+Explicit blocker: there is still no authentication, so the transport is only as
+safe as the loopback boundary. Adding an authentication mechanism is tracked as a
+separate follow-up (see the authentication note above); do not expose this server
+to a network in the meantime.
+
 ## Extension Settings
 
 * `vscode-mcp-server.port`: The port number for the MCP server (default: 3000)

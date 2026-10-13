@@ -24,7 +24,8 @@ suite('Extension Test Suite', () => {
         mockMCPServer = {
             start: sinon.stub().resolves(),
             stop: sinon.stub().resolves(),
-            setFileListingCallback: sinon.spy()
+            setFileListingCallback: sinon.spy(),
+            setupTools: sinon.spy()
         };
         
         // Mock constructor for MCPServer
@@ -46,6 +47,11 @@ suite('Extension Test Suite', () => {
         
         // Mock vscode.window.createStatusBarItem
         createStatusBarItemStub = sinon.stub(vscode.window, 'createStatusBarItem').returns(statusBarItem);
+        // Mock terminal creation so activation does not open a real terminal
+        sinon.stub(vscode.window, 'createTerminal').returns({
+            name: 'MCP Shell Commands',
+            dispose: sinon.spy()
+        } as any);
         
         // Mock configuration
         workspaceConfig = {
@@ -55,6 +61,11 @@ suite('Extension Test Suite', () => {
         
         // Create a mocked extension context
         context = createMockContext();
+        // Enable the server so activation exercises the real start path
+        // (terminal creation, MCPServer construction, setupTools, start).
+        (context.globalState as any).get = sinon.stub().callsFake((key: string, defaultValue: unknown) =>
+            key === 'mcpServerEnabled' ? true : defaultValue
+        );
         
         // Mock command registration
         registerCommandStub = sinon.stub(vscode.commands, 'registerCommand').returns({
@@ -82,6 +93,11 @@ suite('Extension Test Suite', () => {
         
         // Check that MCPServer was created with configured port
         assert.strictEqual(MockServerConstructor.calledWith(4321), true, 'MCPServer not created with configured port');
+
+        // The enabled server must be wired up and started
+        assert.strictEqual(mockMCPServer.setFileListingCallback.called, true, 'File listing callback not set');
+        assert.strictEqual(mockMCPServer.setupTools.called, true, 'Tools not set up');
+        assert.strictEqual(mockMCPServer.start.called, true, 'Server not started');
     });
 
     test('Status bar item should be created with proper attributes', async () => {
@@ -91,8 +107,9 @@ suite('Extension Test Suite', () => {
         // Verify status bar was created
         assert.strictEqual(createStatusBarItemStub.called, true, 'Status bar item not created');
         
-        // Check the status bar attributes
-        assert.strictEqual(statusBarItem.command, 'vscode-mcp-server.showServerInfo', 'Status bar command not set correctly');
+        // The status bar is a toggle: clicking it must toggle the server, and
+        // the text must show the configured port while the server is enabled.
+        assert.strictEqual(statusBarItem.command, 'vscode-mcp-server.toggleServer', 'Status bar command not set correctly');
         assert.strictEqual(statusBarItem.show.called, true, 'Status bar not shown');
         
         // Check that the text contains the port number
