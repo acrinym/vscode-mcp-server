@@ -231,6 +231,30 @@ The extension creates an MCP server that:
 
 Currently, only one workspace is supported. The extension also only works locally, to avoid exposing your VS Code instance to any network you may be connected to.
 
+### Remote / non-loopback use
+
+The server has no authentication and exposes shell and file access. It therefore
+refuses to start when `vscode-mcp-server.host` is set to a non-loopback address;
+use the default `127.0.0.1` (or `localhost`). Cross-origin (CORS) requests are
+only allowed from loopback origins, and the loopback decision is reflected on
+every response (not only the preflight), so a web page served from the network
+cannot read a response or drive the server. Local command-line MCP clients (for
+example via `mcp-remote`) are unaffected because they do not send a browser
+`Origin` header.
+
+Server-side session state is bounded: a session is closed after 5 minutes
+without a request, and at most 100 sessions are tracked at once (new
+initializations beyond that are rejected). A client that is still active keeps
+its session because the idle countdown restarts only once the last in-flight
+request on that session has settled. A request that runs longer than the idle
+timeout is therefore never dropped mid-flight, and a session is reclaimed only
+after it has actually gone idle.
+
+Explicit blocker: there is still no authentication, so the transport is only as
+safe as the loopback boundary. Adding an authentication mechanism is tracked as a
+separate follow-up (see the authentication note above); do not expose this server
+to a network in the meantime.
+
 ## Extension Settings
 
 * `vscode-mcp-server.port`: The port number for the MCP server (default: 3000)
@@ -247,10 +271,9 @@ To connect MCP clients to this server, configure them to use:
 http://localhost:3000/mcp
 ```
 
-Or if you've configured a custom host:
-```
-http://[your-host]:3000/mcp
-```
+The host is always a loopback address: the server refuses to bind anything else,
+so a custom `vscode-mcp-server.host` value must be `127.0.0.1`, `localhost`, or
+`::1`. Only the port can differ from the example above.
 
 Remember that you need to enable the server first by clicking on the status bar item!
 

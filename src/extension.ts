@@ -105,7 +105,6 @@ async function toggleServerState(context: vscode.ExtensionContext): Promise<void
                     throw error;
                 }
             });
-            mcpServer.setupTools();
             
             logger.info(`[toggleServerState] Starting server at ${new Date().toISOString()}`);
             const startTime = Date.now();
@@ -189,8 +188,6 @@ export async function activate(context: vscode.ExtensionContext) {
                 }
             });
             
-            // Call setupTools after setting the callback
-            mcpServer.setupTools();
 
             await mcpServer.start();
             logger.info('MCP Server started successfully');
@@ -243,7 +240,6 @@ export async function activate(context: vscode.ExtensionContext) {
                             throw error;
                         }
                     });
-                    mcpServer.setupTools();
                     await mcpServer.start();
                     
                     vscode.window.showInformationMessage('MCP Server restarted with updated tool configuration');
