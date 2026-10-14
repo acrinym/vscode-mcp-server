@@ -245,7 +245,10 @@ example via `mcp-remote`) are unaffected because they do not send a browser
 Server-side session state is bounded: a session is closed after 5 minutes
 without a request, and at most 100 sessions are tracked at once (new
 initializations beyond that are rejected). A client that is still active keeps
-its session because every request resets the idle timer.
+its session because the idle countdown restarts only once the last in-flight
+request on that session has settled. A request that runs longer than the idle
+timeout is therefore never dropped mid-flight, and a session is reclaimed only
+after it has actually gone idle.
 
 Explicit blocker: there is still no authentication, so the transport is only as
 safe as the loopback boundary. Adding an authentication mechanism is tracked as a

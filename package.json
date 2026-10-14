@@ -95,6 +95,7 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
+    "smoke": "node scripts/smoke-mcp-session.js",
     "package": "vsce package"
   },
   "devDependencies": {

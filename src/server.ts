@@ -73,6 +73,11 @@ export class MCPServer {
     // number of concurrent sessions is capped at maxSessions. Both bound the
     // state an unauthenticated client can pin on the server.
     private idleTimers: Map<string, NodeJS.Timeout> = new Map();
+    // Number of requests currently being handled per session. A busy session
+    // must never be reclaimed: closing its transport would drop the pending
+    // response and leave the client hung. A count (not a flag) is required so
+    // that concurrent requests on one session are all accounted for.
+    private inFlight: Map<string, number> = new Map();
     private readonly idleTimeoutMs: number;
     private readonly maxSessions: number;
     // Concurrent stop() callers await the same in-flight shutdown.
@@ -227,16 +232,18 @@ export class MCPServer {
                 this.pendingTransports.delete(transport);
                 this.transports.set(sessionId, transport);
                 this.servers.set(sessionId, server);
-                this.touchSession(sessionId);
+                // Initialization is itself an in-flight request: keep the
+                // session busy (and timer-free) until it settles below.
+                this.beginRequest(sessionId);
             },
         });
 
         transport.onclose = () => {
             const closedId = transport.sessionId;
             if (closedId) {
-                // Deleting before closing makes the re-entrant close() triggered
-                // by Protocol.close() a no-op.
-                this.closeSession(closedId);
+                // The transport is already closed (for example by the SDK's own
+                // DELETE handling), so only drop the bookkeeping.
+                this.unregisterSession(closedId);
             } else {
                 this.pendingTransports.delete(transport);
             }
@@ -247,6 +254,10 @@ export class MCPServer {
         try {
             await server.connect(transport);
             await transport.handleRequest(req, res, req.body);
+            if (transport.sessionId) {
+                // Initialization settled; the session may now go idle.
+                this.endRequest(transport.sessionId);
+            }
         } catch (error) {
             if (transport.sessionId) {
                 this.closeSession(transport.sessionId);
@@ -265,17 +276,49 @@ export class MCPServer {
         return this.transports.size + this.pendingTransports.size;
     }
 
+    /** Marks the start of an in-flight request for the session. */
+    private beginRequest(sessionId: string): void {
+        this.inFlight.set(sessionId, (this.inFlight.get(sessionId) ?? 0) + 1);
+        this.clearIdleTimer(sessionId);
+    }
+
     /**
-     * (Re)starts the idle timer for a live session. Sessions that go idle are
-     * reclaimed so an abandoned client cannot pin a transport and server
-     * forever.
+     * Settles one in-flight request. The idle countdown restarts only once the
+     * last in-flight request has settled, so a long or concurrent request
+     * cannot be reclaimed mid-flight while an abandoned session still expires.
+     */
+    private endRequest(sessionId: string): void {
+        const remaining = (this.inFlight.get(sessionId) ?? 1) - 1;
+        if (remaining > 0) {
+            this.inFlight.set(sessionId, remaining);
+        } else {
+            this.inFlight.delete(sessionId);
+        }
+        this.touchSession(sessionId);
+    }
+
+    /** True while at least one request is being handled for the session. */
+    private isBusy(sessionId: string): boolean {
+        return (this.inFlight.get(sessionId) ?? 0) > 0;
+    }
+
+    /**
+     * (Re)starts the idle timer for a live session, but only while it is idle.
+     * Sessions that go idle are reclaimed so an abandoned client cannot pin a
+     * transport and server forever; a busy session is left alone until its
+     * final in-flight request settles.
      */
     private touchSession(sessionId: string): void {
-        if (!this.transports.has(sessionId)) {
+        if (!this.transports.has(sessionId) || this.isBusy(sessionId)) {
             return;
         }
         this.clearIdleTimer(sessionId);
         const timer = setTimeout(() => {
+            // A request may have arrived after the timer fired; never close a
+            // session that is still doing work.
+            if (this.isBusy(sessionId)) {
+                return;
+            }
             logger.info(`[MCPServer] Closing idle MCP session ${sessionId} after ${this.idleTimeoutMs}ms`);
             this.closeSession(sessionId);
         }, this.idleTimeoutMs);
@@ -292,11 +335,24 @@ export class MCPServer {
     }
 
     /**
-     * Tears down one session. Removing it from the maps first makes repeated
-     * calls (for example from the transport's own onclose) safe no-ops.
+     * Drops the bookkeeping for a session whose transport has already closed.
+     * Safe to call repeatedly.
+     */
+    private unregisterSession(sessionId: string): void {
+        this.clearIdleTimer(sessionId);
+        this.inFlight.delete(sessionId);
+        this.transports.delete(sessionId);
+        this.servers.delete(sessionId);
+    }
+
+    /**
+     * Tears down one session, closing its transport and server. Removing the
+     * session from the maps first makes repeated calls (for example from the
+     * transport's own onclose) exactly-once no-ops.
      */
     private closeSession(sessionId: string): void {
         this.clearIdleTimer(sessionId);
+        this.inFlight.delete(sessionId);
         const transport = this.transports.get(sessionId);
         this.transports.delete(sessionId);
         const server = this.servers.get(sessionId);
@@ -324,6 +380,7 @@ export class MCPServer {
         this.transports.clear();
         this.pendingTransports.clear();
         this.servers.clear();
+        this.inFlight.clear();
 
         await Promise.all(transports.map((transport) =>
             transport.close().catch((error) => {
@@ -353,14 +410,19 @@ export class MCPServer {
                     this.sendInvalidSession(res);
                     return;
                 }
-                // Refresh before and after so a slow in-flight request cannot be
-                // reclaimed by a timer left over from the previous request.
-                this.touchSession(parsed.sessionId);
-                await transport.handleRequest(req, res, req.body);
-                this.touchSession(parsed.sessionId);
+                // Mark the session busy so the idle timer cannot reclaim it
+                // while this request is in flight; the countdown restarts only
+                // after the request settles.
+                this.beginRequest(parsed.sessionId);
+                try {
+                    await transport.handleRequest(req, res, req.body);
+                } finally {
+                    this.endRequest(parsed.sessionId);
+                }
                 return;
             }
 
+            // A missing session id is only valid for an initialization request.
             if (isInitializeRequest(req.body)) {
                 await this.createSession(req, res);
                 return;
@@ -395,21 +457,26 @@ export class MCPServer {
 
     private async handleSessionRequest(req: Request, res: Response): Promise<void> {
         const parsed = this.readSessionId(req);
-        const transport = parsed.status === 'ok' ? this.transports.get(parsed.sessionId) : undefined;
-
+        if (parsed.status !== 'ok') {
+            this.sendInvalidSession(res);
+            return;
+        }
+        const transport = this.transports.get(parsed.sessionId);
         if (!transport) {
             this.sendInvalidSession(res);
             return;
         }
 
+        // A GET opens the long-lived standalone SSE stream, which legitimately
+        // stays open far longer than the idle timeout. It must therefore not be
+        // counted as in-flight work. DELETE tears the session down, so it is not
+        // counted either; the transport's own onclose unregisters the session.
+        const tracksInFlight = req.method !== 'GET';
+        if (tracksInFlight) {
+            this.beginRequest(parsed.sessionId);
+        }
         try {
-            if (parsed.status === 'ok') {
-                this.touchSession(parsed.sessionId);
-            }
             await transport.handleRequest(req as IncomingMessage, res);
-            if (parsed.status === 'ok') {
-                this.touchSession(parsed.sessionId);
-            }
         } catch (error) {
             logger.error(`Error handling MCP session request: ${error instanceof Error ? error.message : String(error)}`);
             if (!res.headersSent) {
@@ -421,6 +488,10 @@ export class MCPServer {
                     },
                     id: null,
                 });
+            }
+        } finally {
+            if (tracksInFlight) {
+                this.endRequest(parsed.sessionId);
             }
         }
     }

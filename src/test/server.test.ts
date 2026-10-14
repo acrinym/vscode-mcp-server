@@ -97,10 +97,24 @@ function rawRequest(
     });
 }
 
-function startServer(limits: SessionLimits = {}): MCPServer {
+function startServer(limits: SessionLimits = {}, callback?: () => Promise<FileListingResult>): MCPServer {
     const server = new MCPServer(0, '127.0.0.1', undefined, FILE_TOOLS_ONLY, limits);
-    server.setFileListingCallback(async () => FILES);
+    server.setFileListingCallback(callback ?? (async () => FILES));
     return server;
+}
+
+/** A callback that blocks until release() is called, for in-flight tests. */
+function gatedCallback(): { callback: () => Promise<FileListingResult>; release: () => void; started: Promise<void> } {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const callback = async (): Promise<FileListingResult> => {
+        started();
+        await gate;
+        return FILES;
+    };
+    return { callback, release, started: startedPromise };
 }
 
 suite('MCPServer transport lifecycle', () => {
@@ -237,6 +251,183 @@ suite('MCPServer transport lifecycle', () => {
         } finally {
             await client.close();
             await idleServer.stop();
+        }
+    });
+
+    test('work exceeding idleTimeoutMs completes and expires only after idle', async () => {
+        const gate = gatedCallback();
+        const slowServer = startServer({ idleTimeoutMs: 300 }, gate.callback);
+        await slowServer.start();
+        const client = new Client({ name: 'slow-client', version: '1.0.0' });
+        const transport = new StreamableHTTPClientTransport(endpoint(slowServer));
+        try {
+            await client.connect(transport);
+            const sessionId = transport.sessionId;
+            assert.ok(sessionId, 'expected a session id after initialize');
+
+            const slowCall = client.callTool({
+                name: 'list_files_code',
+                arguments: { path: '.', recursive: false }
+            });
+            await gate.started;
+            // Let the idle timeout elapse while the request is still in flight.
+            await sleep(700);
+
+            // tools/list does not touch the gated callback, so it returns
+            // immediately and proves the session is still alive mid-flight.
+            const stillAlive = await client.listTools();
+            assert.strictEqual(stillAlive.tools.length, 5, 'session was evicted while a request was in flight');
+
+            gate.release();
+            const result = await slowCall;
+            const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+            assert.deepStrictEqual(JSON.parse(text), FILES);
+
+            // Usable after the long call.
+            const tools = await client.listTools();
+            assert.strictEqual(tools.tools.length, 5);
+
+            // Expires only once it is genuinely idle.
+            await sleep(700);
+            const expired = await rawRequest(slowServer.boundPort!, 'POST', LIST_TOOLS_BODY, {
+                sessionHeaders: [sessionId]
+            });
+            assert.strictEqual(expired.status, 400, 'idle session was not reclaimed');
+        } finally {
+            gate.release();
+            await client.close();
+            await slowServer.stop();
+        }
+    });
+
+    test('concurrent in-flight requests on one session are never evicted mid-flight', async () => {
+        const gate = gatedCallback();
+        const concurrentServer = startServer({ idleTimeoutMs: 250 }, gate.callback);
+        await concurrentServer.start();
+        const client = new Client({ name: 'concurrent-client', version: '1.0.0' });
+        const transport = new StreamableHTTPClientTransport(endpoint(concurrentServer));
+        try {
+            await client.connect(transport);
+            const sessionId = transport.sessionId;
+            assert.ok(sessionId, 'expected a session id after initialize');
+
+            const calls = [
+                client.callTool({ name: 'list_files_code', arguments: { path: '.', recursive: false } }),
+                client.callTool({ name: 'list_files_code', arguments: { path: '.', recursive: false } }),
+                client.callTool({ name: 'list_files_code', arguments: { path: '.', recursive: false } })
+            ];
+            // Longer than the idle timeout while all three calls are in flight.
+            await sleep(600);
+            // An independent request that returns immediately proves the
+            // session was not evicted with concurrent calls in flight.
+            const alive = await client.listTools();
+            assert.strictEqual(alive.tools.length, 5, 'session evicted with concurrent requests in flight');
+
+            gate.release();
+            const results = await Promise.all(calls);
+            for (const result of results) {
+                const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+                assert.deepStrictEqual(JSON.parse(text), FILES);
+            }
+        } finally {
+            gate.release();
+            await client.close();
+            await concurrentServer.stop();
+        }
+    });
+
+    test('DELETE during an in-flight request is race-safe', async () => {
+        const gate = gatedCallback();
+        const deleteServer = startServer({ idleTimeoutMs: 60_000 }, gate.callback);
+        await deleteServer.start();
+        const client = new Client({ name: 'delete-race', version: '1.0.0' });
+        const transport = new StreamableHTTPClientTransport(endpoint(deleteServer));
+        try {
+            await client.connect(transport);
+            const sessionId = transport.sessionId;
+            assert.ok(sessionId, 'expected a session id after initialize');
+
+            const slowCall = client.callTool({
+                name: 'list_files_code',
+                arguments: { path: '.', recursive: false }
+            });
+            // The in-flight call is expected to be dropped by the session
+            // teardown, so only guard against an unhandled rejection.
+            slowCall.catch(() => undefined);
+            await gate.started;
+
+            // DELETE the session while the call is in flight: teardown must not
+            // throw and the session must be gone afterwards.
+            const deleted = await rawRequest(deleteServer.boundPort!, 'DELETE', undefined, {
+                sessionHeaders: [sessionId]
+            });
+            assert.strictEqual(deleted.status, 200);
+
+            gate.release();
+
+            const after = await rawRequest(deleteServer.boundPort!, 'POST', LIST_TOOLS_BODY, {
+                sessionHeaders: [sessionId]
+            });
+            assert.strictEqual(after.status, 400, 'session survived DELETE');
+        } finally {
+            gate.release();
+            // Closing the client aborts any call the DELETE dropped, so the
+            // test cannot hang on a response that will never arrive.
+            await client.close();
+            await deleteServer.stop();
+        }
+    });
+
+    test('stop() during an in-flight request is deterministic', async () => {
+        const gate = gatedCallback();
+        const stopRaceServer = startServer({ idleTimeoutMs: 60_000 }, gate.callback);
+        await stopRaceServer.start();
+        const client = new Client({ name: 'stop-race', version: '1.0.0' });
+        const transport = new StreamableHTTPClientTransport(endpoint(stopRaceServer));
+        try {
+            await client.connect(transport);
+            const slowCall = client.callTool({
+                name: 'list_files_code',
+                arguments: { path: '.', recursive: false }
+            });
+            slowCall.catch(() => undefined);
+            await gate.started;
+
+            // Concurrent stop() calls must all resolve promptly (each waits at
+            // most the force timeout) even though a request is in flight.
+            await Promise.all([stopRaceServer.stop(200), stopRaceServer.stop(200)]);
+            assert.strictEqual(stopRaceServer.boundPort, undefined);
+
+            gate.release();
+        } finally {
+            gate.release();
+            await client.close();
+        }
+    });
+
+    test('concurrent initializations respect maxSessions exactly', async () => {
+        const capServer = startServer({ idleTimeoutMs: 60_000, maxSessions: 3 });
+        await capServer.start();
+        try {
+            const responses = await Promise.all(
+                Array.from({ length: 8 }, () => rawRequest(capServer.boundPort!, 'POST', INITIALIZE_BODY))
+            );
+            const accepted = responses.filter((response) => response.status === 200).length;
+            const rejected = responses.filter((response) => response.status === 503).length;
+            assert.strictEqual(accepted, 3, `expected exactly 3 accepted sessions, got ${accepted}`);
+            assert.strictEqual(rejected, 5, `expected 5 rejections, got ${rejected}`);
+        } finally {
+            await capServer.stop();
+        }
+    });
+
+    test('repeated start/stop lifecycles are deterministic', async () => {
+        const cycleServer = startServer();
+        for (let i = 0; i < 3; i++) {
+            await cycleServer.start();
+            assert.ok(cycleServer.boundPort, `no port bound on cycle ${i}`);
+            await cycleServer.stop();
+            assert.strictEqual(cycleServer.boundPort, undefined, `port still bound after cycle ${i}`);
         }
     });
 
