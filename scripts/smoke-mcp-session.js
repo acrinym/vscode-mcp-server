@@ -225,6 +225,64 @@ async function main() {
         assert.strictEqual(server.boundPort, undefined);
     });
 
+    // 6. Deterministic stress: repeat the in-flight/idle race and the
+    //    DELETE/stop races many times with no retries. Any single eviction,
+    //    hang, or double-teardown fails the run.
+    await step('stress: in-flight race and DELETE/stop races, zero retries', async () => {
+        const iterations = 12;
+        for (let i = 0; i < iterations; i++) {
+            const gate = { release: undefined, started: undefined };
+            const open = new Promise((resolve) => { gate.release = resolve; });
+            const started = new Promise((resolve) => { gate.started = resolve; });
+            const server = new MCPServer(0, '127.0.0.1', undefined, FILE_TOOLS_ONLY, { idleTimeoutMs: 120 });
+            server.setFileListingCallback(async () => { gate.started(); await open; return FILES; });
+            await server.start();
+            const client = new Client({ name: `stress-${i}`, version: '1.0.0' });
+            const transport = new StreamableHTTPClientTransport(endpoint(server));
+            try {
+                await client.connect(transport);
+                const call = client.callTool({ name: 'list_files_code', arguments: { path: '.', recursive: false } });
+                await started;
+                await sleep(250);
+                // Session must still be alive while the call is in flight.
+                const tools = await client.listTools();
+                assert.strictEqual(tools.tools.length, 5, `iteration ${i}: evicted mid-flight`);
+                gate.release();
+                const result = await call;
+                assert.deepStrictEqual(JSON.parse(result.content[0].text), FILES, `iteration ${i}: wrong result`);
+            } finally {
+                gate.release();
+                await client.close();
+                await server.stop();
+            }
+
+            // Race DELETE against an in-flight call, then stop concurrently.
+            const raceGate = { release: undefined, started: undefined };
+            const raceOpen = new Promise((resolve) => { raceGate.release = resolve; });
+            const raceStarted = new Promise((resolve) => { raceGate.started = resolve; });
+            const raceServer = new MCPServer(0, '127.0.0.1', undefined, FILE_TOOLS_ONLY, { idleTimeoutMs: 60_000 });
+            raceServer.setFileListingCallback(async () => { raceGate.started(); await raceOpen; return FILES; });
+            await raceServer.start();
+            const raceClient = new Client({ name: `stress-race-${i}`, version: '1.0.0' });
+            const raceTransport = new StreamableHTTPClientTransport(endpoint(raceServer));
+            await raceClient.connect(raceTransport);
+            const sessionId = raceTransport.sessionId;
+            const raceCall = raceClient.callTool({ name: 'list_files_code', arguments: { path: '.', recursive: false } });
+            raceCall.catch(() => undefined);
+            await raceStarted;
+            const deleted = await rawRequest(raceServer.boundPort, 'DELETE', undefined, { sessionId });
+            assert.strictEqual(deleted.status, 200, `iteration ${i}: DELETE failed`);
+            raceGate.release();
+            const after = await rawRequest(raceServer.boundPort, 'POST',
+                { jsonrpc: '2.0', id: 7, method: 'tools/list', params: {} }, { sessionId });
+            assert.strictEqual(after.status, 400, `iteration ${i}: session survived DELETE`);
+            await Promise.all([raceServer.stop(200), raceServer.stop(200)]);
+            assert.strictEqual(raceServer.boundPort, undefined, `iteration ${i}: server still bound`);
+            await raceClient.close();
+        }
+        console.log(`stress: ${iterations} iterations, 0 failures`);
+    });
+
     console.log(`\nSmoke PASS: ${passed.length} checks`);
 }
 
