@@ -22,6 +22,21 @@ export interface ToolConfiguration {
 }
 
 /**
+ * Optional bounds on server-side MCP session state. Both default to a value
+ * that keeps a single local client comfortable while still capping the memory
+ * an unauthenticated client can pin.
+ */
+export interface SessionLimits {
+    /** Close a session after this many ms without a request. */
+    idleTimeoutMs?: number;
+    /** Reject new sessions once this many are concurrently tracked. */
+    maxSessions?: number;
+}
+
+export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+export const DEFAULT_MAX_SESSIONS = 100;
+
+/**
  * Returns true only for origins served from the loopback interface. Browser
  * clients running on the local machine are allowed; any other origin is not,
  * so a page on the network cannot drive this (unauthenticated) server.
@@ -47,11 +62,21 @@ export class MCPServer {
     // transport and its own McpServer. A single transport must not be reused
     // across requests (the SDK rejects stateless reuse), and a single McpServer
     // can only be connected to one transport at a time, so sessions cannot
-    // share either.
+    // share either. Sessions are keyed by the id the transport reports.
     private transports: Map<string, StreamableHTTPServerTransport> = new Map();
-    private pendingTransports: Set<StreamableHTTPServerTransport> = new Set();
     private servers: Map<string, McpServer> = new Map();
-    private isClosing: boolean = false;
+    // Transports that are mid-initialization, before they have reported a
+    // session id. Tracked so a request that fails before initialization is
+    // still reachable for cleanup.
+    private pendingTransports: Set<StreamableHTTPServerTransport> = new Set();
+    // Idle sessions are reclaimed after idleTimeoutMs of inactivity and the
+    // number of concurrent sessions is capped at maxSessions. Both bound the
+    // state an unauthenticated client can pin on the server.
+    private idleTimers: Map<string, NodeJS.Timeout> = new Map();
+    private readonly idleTimeoutMs: number;
+    private readonly maxSessions: number;
+    // Concurrent stop() callers await the same in-flight shutdown.
+    private stopPromise?: Promise<void>;
 
     public setFileListingCallback(callback: FileListingCallback) {
         this.fileListingCallback = callback;
@@ -66,7 +91,7 @@ export class MCPServer {
         return typeof address === 'object' && address !== null ? address.port : undefined;
     }
 
-    constructor(port: number = 3000, host: string = '127.0.0.1', terminal?: vscode.Terminal, toolConfig?: ToolConfiguration) {
+    constructor(port: number = 3000, host: string = '127.0.0.1', terminal?: vscode.Terminal, toolConfig?: ToolConfiguration, limits: SessionLimits = {}) {
         this.port = port;
         this.host = host;
         this.terminal = terminal;
@@ -77,7 +102,10 @@ export class MCPServer {
             diagnostics: true,
             symbol: true
         };
+        this.idleTimeoutMs = limits.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+        this.maxSessions = limits.maxSessions ?? DEFAULT_MAX_SESSIONS;
         this.app = express();
+        this.setupCors();
         this.app.use(express.json());
 
         this.setupRoutes();
@@ -109,7 +137,7 @@ export class MCPServer {
      * Validates the tool configuration. Tools are registered on each session's
      * server instance when a session is initialized.
      */
-    public setupTools(): void {
+    private logToolConfiguration(): void {
         if (!this.fileListingCallback) {
             logger.warn('File listing callback not set during tools setup');
             return;
@@ -150,11 +178,47 @@ export class MCPServer {
     }
 
     /**
+     * Reads the Mcp-Session-Id header. A session id must be a single opaque
+     * token: Node joins repeated headers with ", " and may hand back an array,
+     * so a duplicate/array header is reported as invalid rather than being
+     * concatenated into a value that can never match a session.
+     */
+    private readSessionId(req: Request): { status: 'absent' } | { status: 'invalid' } | { status: 'ok'; sessionId: string } {
+        const raw = req.headers['mcp-session-id'];
+        if (raw === undefined) {
+            return { status: 'absent' };
+        }
+        if (typeof raw !== 'string') {
+            return { status: 'invalid' };
+        }
+        const sessionId = raw.trim();
+        if (sessionId.length === 0 || sessionId.includes(',')) {
+            return { status: 'invalid' };
+        }
+        return { status: 'ok', sessionId };
+    }
+
+    /**
      * Creates a fresh transport and its server for a new MCP session. The
-     * transport is tracked immediately (before it has a session id) and moved to
-     * its session id once initialization assigns one.
+     * transport generates its own session id during initialization and reports
+     * it via onsessioninitialized, so the session is registered under that id.
+     * While initialization is in flight the transport is held in
+     * pendingTransports so it is always reachable for cleanup.
      */
     private async createSession(req: Request, res: Response): Promise<void> {
+        if (this.sessionCount() >= this.maxSessions) {
+            logger.warn(`[MCPServer] Refusing new MCP session: ${this.sessionCount()} sessions already tracked (max ${this.maxSessions})`);
+            res.status(503).json({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32000,
+                    message: 'Server busy: too many active MCP sessions',
+                },
+                id: null,
+            });
+            return;
+        }
+
         const server = this.createServer();
         const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
@@ -163,70 +227,137 @@ export class MCPServer {
                 this.pendingTransports.delete(transport);
                 this.transports.set(sessionId, transport);
                 this.servers.set(sessionId, server);
+                this.touchSession(sessionId);
             },
         });
-        // Track while pending so it is always reachable for cleanup.
-        this.pendingTransports.add(transport);
 
         transport.onclose = () => {
-            this.pendingTransports.delete(transport);
-            const sessionId = transport.sessionId;
-            if (sessionId) {
-                this.transports.delete(sessionId);
-                const sessionServer = this.servers.get(sessionId);
-                this.servers.delete(sessionId);
-                sessionServer?.close().catch((error) => {
-                    logger.error(`Error closing session server: ${error instanceof Error ? error.message : String(error)}`);
-                });
+            const closedId = transport.sessionId;
+            if (closedId) {
+                // Deleting before closing makes the re-entrant close() triggered
+                // by Protocol.close() a no-op.
+                this.closeSession(closedId);
+            } else {
+                this.pendingTransports.delete(transport);
             }
         };
 
-        await server.connect(transport);
-        await transport.handleRequest(req, res, req.body);
+        this.pendingTransports.add(transport);
+
+        try {
+            await server.connect(transport);
+            await transport.handleRequest(req, res, req.body);
+        } catch (error) {
+            if (transport.sessionId) {
+                this.closeSession(transport.sessionId);
+            } else {
+                this.pendingTransports.delete(transport);
+                await server.close().catch((closeError) => {
+                    logger.error(`Error closing session server: ${closeError instanceof Error ? closeError.message : String(closeError)}`);
+                });
+            }
+            throw error;
+        }
+    }
+
+    /** Number of tracked sessions, including those still initializing. */
+    private sessionCount(): number {
+        return this.transports.size + this.pendingTransports.size;
+    }
+
+    /**
+     * (Re)starts the idle timer for a live session. Sessions that go idle are
+     * reclaimed so an abandoned client cannot pin a transport and server
+     * forever.
+     */
+    private touchSession(sessionId: string): void {
+        if (!this.transports.has(sessionId)) {
+            return;
+        }
+        this.clearIdleTimer(sessionId);
+        const timer = setTimeout(() => {
+            logger.info(`[MCPServer] Closing idle MCP session ${sessionId} after ${this.idleTimeoutMs}ms`);
+            this.closeSession(sessionId);
+        }, this.idleTimeoutMs);
+        timer.unref?.();
+        this.idleTimers.set(sessionId, timer);
+    }
+
+    private clearIdleTimer(sessionId: string): void {
+        const timer = this.idleTimers.get(sessionId);
+        if (timer) {
+            clearTimeout(timer);
+            this.idleTimers.delete(sessionId);
+        }
+    }
+
+    /**
+     * Tears down one session. Removing it from the maps first makes repeated
+     * calls (for example from the transport's own onclose) safe no-ops.
+     */
+    private closeSession(sessionId: string): void {
+        this.clearIdleTimer(sessionId);
+        const transport = this.transports.get(sessionId);
+        this.transports.delete(sessionId);
+        const server = this.servers.get(sessionId);
+        this.servers.delete(sessionId);
+
+        transport?.close().catch((error) => {
+            logger.error(`Error closing session transport: ${error instanceof Error ? error.message : String(error)}`);
+        });
+        server?.close().catch((error) => {
+            logger.error(`Error closing session server: ${error instanceof Error ? error.message : String(error)}`);
+        });
     }
 
     private async closeAllTransports(): Promise<void> {
-        const allTransports = [
+        const transports = [
             ...this.transports.values(),
             ...this.pendingTransports.values(),
         ];
-        const closing = allTransports.map((transport) =>
+        const servers = Array.from(this.servers.values());
+        for (const sessionId of Array.from(this.idleTimers.keys())) {
+            this.clearIdleTimer(sessionId);
+        }
+        // Clear the maps before closing so the onclose handlers triggered by
+        // transport.close() do not attempt to close anything a second time.
+        this.transports.clear();
+        this.pendingTransports.clear();
+        this.servers.clear();
+
+        await Promise.all(transports.map((transport) =>
             transport.close().catch((error) => {
                 logger.error(`Error closing transport: ${error instanceof Error ? error.message : String(error)}`);
             })
-        );
-        await Promise.all(closing);
-        this.transports.clear();
-        this.pendingTransports.clear();
-
-        const closingServers = Array.from(this.servers.values()).map((server) =>
+        ));
+        await Promise.all(servers.map((server) =>
             server.close().catch((error) => {
                 logger.error(`Error closing session server: ${error instanceof Error ? error.message : String(error)}`);
             })
-        );
-        await Promise.all(closingServers);
-        this.servers.clear();
+        ));
     }
 
     private async handlePost(req: Request, res: Response): Promise<void> {
         logger.info(`Request received: ${req.method} ${req.url}`);
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        const parsed = this.readSessionId(req);
 
         try {
-            if (sessionId) {
-                const transport = this.transports.get(sessionId);
+            if (parsed.status === 'invalid') {
+                this.sendInvalidSession(res);
+                return;
+            }
+
+            if (parsed.status === 'ok') {
+                const transport = this.transports.get(parsed.sessionId);
                 if (!transport) {
-                    res.status(400).json({
-                        jsonrpc: '2.0',
-                        error: {
-                            code: -32000,
-                            message: 'Bad Request: No valid session ID provided',
-                        },
-                        id: null,
-                    });
+                    this.sendInvalidSession(res);
                     return;
                 }
+                // Refresh before and after so a slow in-flight request cannot be
+                // reclaimed by a timer left over from the previous request.
+                this.touchSession(parsed.sessionId);
                 await transport.handleRequest(req, res, req.body);
+                this.touchSession(parsed.sessionId);
                 return;
             }
 
@@ -235,14 +366,7 @@ export class MCPServer {
                 return;
             }
 
-            res.status(400).json({
-                jsonrpc: '2.0',
-                error: {
-                    code: -32000,
-                    message: 'Bad Request: No valid session ID provided',
-                },
-                id: null,
-            });
+            this.sendInvalidSession(res);
         } catch (error) {
             logger.error(`Error handling MCP request: ${error instanceof Error ? error.message : String(error)}`);
             if (!res.headersSent) {
@@ -258,24 +382,34 @@ export class MCPServer {
         }
     }
 
+    private sendInvalidSession(res: Response): void {
+        res.status(400).json({
+            jsonrpc: '2.0',
+            error: {
+                code: -32000,
+                message: 'Bad Request: No valid session ID provided',
+            },
+            id: null,
+        });
+    }
+
     private async handleSessionRequest(req: Request, res: Response): Promise<void> {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        const transport = sessionId ? this.transports.get(sessionId) : undefined;
+        const parsed = this.readSessionId(req);
+        const transport = parsed.status === 'ok' ? this.transports.get(parsed.sessionId) : undefined;
 
         if (!transport) {
-            res.status(400).json({
-                jsonrpc: '2.0',
-                error: {
-                    code: -32000,
-                    message: 'Bad Request: No valid session ID provided',
-                },
-                id: null,
-            });
+            this.sendInvalidSession(res);
             return;
         }
 
         try {
+            if (parsed.status === 'ok') {
+                this.touchSession(parsed.sessionId);
+            }
             await transport.handleRequest(req as IncomingMessage, res);
+            if (parsed.status === 'ok') {
+                this.touchSession(parsed.sessionId);
+            }
         } catch (error) {
             logger.error(`Error handling MCP session request: ${error instanceof Error ? error.message : String(error)}`);
             if (!res.headersSent) {
@@ -291,6 +425,26 @@ export class MCPServer {
         }
     }
 
+    private setupCors(): void {
+        // Reflect loopback origins on every /mcp response (not only OPTIONS), so
+        // a real browser-style request can read the response. Origins are never
+        // wildcarded: this server has no authentication, so a wildcard would let
+        // any site the user visits drive it. Non-browser clients (for example
+        // mcp-remote) send no Origin header and are unaffected.
+        this.app.use('/mcp', (req, res, next) => {
+            const origin = req.headers.origin;
+            if (origin && isLoopbackOrigin(origin)) {
+                res.setHeader('Access-Control-Allow-Origin', origin);
+                // A browser client must be able to read the session id back.
+                res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+            }
+            // Always vary on Origin so shared caches never reuse a response
+            // across origins, whether or not one was approved.
+            res.setHeader('Vary', 'Origin');
+            next();
+        });
+    }
+
     private setupRoutes(): void {
         // Handle POST requests for client-to-server communication
         this.app.post('/mcp', (req, res) => this.handlePost(req, res));
@@ -300,15 +454,11 @@ export class MCPServer {
         this.app.get('/mcp', (req, res) => this.handleSessionRequest(req, res));
         this.app.delete('/mcp', (req, res) => this.handleSessionRequest(req, res));
 
-        // Handle OPTIONS requests for CORS. Only loopback origins are reflected,
-        // so an arbitrary web page cannot drive this server cross-origin. The
-        // server has no authentication, so a wildcard origin would let any site
-        // the user visits invoke its tools.
+        // Handle OPTIONS preflight requests for CORS. The reflected origin and
+        // Vary header are added by the CORS middleware above.
         this.app.options('/mcp', (req, res) => {
             const origin = req.headers.origin;
             if (origin && isLoopbackOrigin(origin)) {
-                res.setHeader('Access-Control-Allow-Origin', origin);
-                res.setHeader('Vary', 'Origin');
                 res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
                 res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version');
             }
@@ -355,6 +505,11 @@ export class MCPServer {
             logger.info('[MCPServer.start] Starting MCP server');
             const startTime = Date.now();
 
+            // A fresh start begins a new lifecycle, so a completed stop() must
+            // not make a later stop() await the old shutdown.
+            this.stopPromise = undefined;
+            this.logToolConfiguration();
+
             this.requireLoopbackHost();
 
             // Start HTTP server. Transports are created per session on demand.
@@ -381,25 +536,32 @@ export class MCPServer {
     }
 
     public async stop(forceTimeout: number = 5000): Promise<void> {
+        // Idempotent and concurrency-safe: the first caller starts the shutdown,
+        // every later caller (concurrent or sequential) awaits the same promise.
+        if (this.stopPromise) {
+            logger.info('[MCPServer.stop] Shutdown already in progress or complete; awaiting it');
+            return this.stopPromise;
+        }
+        this.stopPromise = this.performStop(forceTimeout);
+        return this.stopPromise;
+    }
+
+    private async performStop(forceTimeout: number): Promise<void> {
         logger.info('[MCPServer.stop] Starting server shutdown process');
         const stopStartTime = Date.now();
-
-        if (this.isClosing) {
-            logger.warn('[MCPServer.stop] Shutdown already in progress');
-            return;
-        }
-        this.isClosing = true;
 
         try {
             // Close HTTP server with timeout
             if (this.httpServer) {
                 logger.info('[MCPServer.stop] Closing HTTP server (with timeout)');
                 const httpServerCloseStart = Date.now();
+                const httpServer = this.httpServer;
+                this.httpServer = undefined;
                 
                 await Promise.race([
                     // Normal close operation
                     new Promise<void>((resolve, reject) => {
-                        this.httpServer!.close((err) => {
+                        httpServer.close((err) => {
                             const httpCloseTime = Date.now() - httpServerCloseStart;
                             if (err) {
                                 logger.error(`[MCPServer.stop] HTTP server closed with error: ${err.message} (took ${httpCloseTime}ms)`);
@@ -433,8 +595,6 @@ export class MCPServer {
         } catch (error) {
             logger.error(`[MCPServer.stop] Error during server shutdown: ${error instanceof Error ? error.message : String(error)}`);
             throw error;
-        } finally {
-            this.isClosing = false;
         }
     }
 }

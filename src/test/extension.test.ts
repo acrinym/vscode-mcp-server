@@ -24,8 +24,7 @@ suite('Extension Test Suite', () => {
         mockMCPServer = {
             start: sinon.stub().resolves(),
             stop: sinon.stub().resolves(),
-            setFileListingCallback: sinon.spy(),
-            setupTools: sinon.spy()
+            setFileListingCallback: sinon.spy()
         };
         
         // Mock constructor for MCPServer
@@ -62,7 +61,7 @@ suite('Extension Test Suite', () => {
         // Create a mocked extension context
         context = createMockContext();
         // Enable the server so activation exercises the real start path
-        // (terminal creation, MCPServer construction, setupTools, start).
+        // (terminal creation, MCPServer construction, callback wiring, start).
         (context.globalState as any).get = sinon.stub().callsFake((key: string, defaultValue: unknown) =>
             key === 'mcpServerEnabled' ? true : defaultValue
         );
@@ -96,7 +95,6 @@ suite('Extension Test Suite', () => {
 
         // The enabled server must be wired up and started
         assert.strictEqual(mockMCPServer.setFileListingCallback.called, true, 'File listing callback not set');
-        assert.strictEqual(mockMCPServer.setupTools.called, true, 'Tools not set up');
         assert.strictEqual(mockMCPServer.start.called, true, 'Server not started');
     });
 
